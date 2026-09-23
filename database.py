@@ -167,6 +167,7 @@ def init_db():
     cursor.execute("ALTER TABLE workshops ADD COLUMN IF NOT EXISTS is_ended INTEGER DEFAULT 0;")
     cursor.execute("ALTER TABLE workshops ADD COLUMN IF NOT EXISTS group_photo_url TEXT DEFAULT '';")
     cursor.execute("ALTER TABLE workshops ADD COLUMN IF NOT EXISTS feedback_prompt TEXT DEFAULT '';")
+    cursor.execute("ALTER TABLE workshops ADD COLUMN IF NOT EXISTS feedback_questions_json TEXT DEFAULT '[]';")
     cursor.execute("ALTER TABLE workshops ADD COLUMN IF NOT EXISTS admin_username TEXT DEFAULT '';")
     cursor.execute("ALTER TABLE workshops ADD COLUMN IF NOT EXISTS admin_password TEXT DEFAULT '';")
 
@@ -308,6 +309,7 @@ def init_db():
         submitted_at TEXT
     );
     """)
+    cursor.execute("ALTER TABLE workshop_feedbacks ADD COLUMN IF NOT EXISTS answers_json TEXT DEFAULT '{}';")
 
     # 11. Subscribers Table
     cursor.execute("""
@@ -403,6 +405,13 @@ def get_all_workshops():
     for r in rows:
         item = dict(r)
         item['topics'] = json.loads(item['topics']) if item.get('topics') else []
+        if item.get('feedback_questions_json'):
+            try:
+                item['feedback_questions'] = json.loads(item['feedback_questions_json'])
+            except Exception:
+                item['feedback_questions'] = []
+        else:
+            item['feedback_questions'] = []
         result.append(redact_workshop_credentials(item))
     return result
 
@@ -415,6 +424,13 @@ def get_workshop_by_id(workshop_id):
     if row:
         item = dict(row)
         item['topics'] = json.loads(item['topics']) if item.get('topics') else []
+        if item.get('feedback_questions_json'):
+            try:
+                item['feedback_questions'] = json.loads(item['feedback_questions_json'])
+            except Exception:
+                item['feedback_questions'] = []
+        else:
+            item['feedback_questions'] = []
         return redact_workshop_credentials(item)
     return None
 
@@ -783,7 +799,8 @@ def student_login(email: str, password: str):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-    SELECT s.*, w.title as full_workshop_title, w.mentor, w.date as workshop_date, w.time as workshop_time, w.topics, w.color
+    SELECT s.*, w.title as full_workshop_title, w.mentor, w.date as workshop_date, w.time as workshop_time, w.topics, w.color,
+           w.is_ended, w.group_photo_url, w.feedback_prompt, w.feedback_questions_json
     FROM students s
     LEFT JOIN workshops w ON s.workshop_id = w.id
     WHERE LOWER(s.email) = LOWER(%s)
@@ -797,6 +814,13 @@ def student_login(email: str, password: str):
                 reg['topics'] = json.loads(reg['topics'])
             except Exception:
                 pass
+        if reg.get('feedback_questions_json'):
+            try:
+                reg['feedback_questions'] = json.loads(reg['feedback_questions_json'])
+            except Exception:
+                reg['feedback_questions'] = []
+        else:
+            reg['feedback_questions'] = []
         if reg.get('allowed') == 1:
             cursor.execute("SELECT * FROM workshop_resources WHERE workshop_id = %s ORDER BY date_added DESC", (reg['workshop_id'],))
             reg['resources'] = [dict(r) for r in cursor.fetchall()]
@@ -816,7 +840,8 @@ def get_student_dashboard_data(email: str):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-    SELECT s.*, w.title as full_workshop_title, w.mentor, w.date as workshop_date, w.time as workshop_time, w.topics, w.color
+    SELECT s.*, w.title as full_workshop_title, w.mentor, w.date as workshop_date, w.time as workshop_time, w.topics, w.color,
+           w.is_ended, w.group_photo_url, w.feedback_prompt, w.feedback_questions_json
     FROM students s
     LEFT JOIN workshops w ON s.workshop_id = w.id
     WHERE LOWER(s.email) = LOWER(%s)
@@ -829,6 +854,13 @@ def get_student_dashboard_data(email: str):
                 reg['topics'] = json.loads(reg['topics'])
             except Exception:
                 pass
+        if reg.get('feedback_questions_json'):
+            try:
+                reg['feedback_questions'] = json.loads(reg['feedback_questions_json'])
+            except Exception:
+                reg['feedback_questions'] = []
+        else:
+            reg['feedback_questions'] = []
         if reg.get('allowed') == 1:
             cursor.execute("SELECT * FROM workshop_resources WHERE workshop_id = %s ORDER BY date_added DESC", (reg['workshop_id'],))
             reg['resources'] = [dict(r) for r in cursor.fetchall()]
@@ -1351,10 +1383,10 @@ def delete_team_member(tm_id: str):
     conn.close()
     return {"status": "success", "deleted_id": tm_id}
 
-def end_workshop(workshop_id: str, group_photo_url: str, feedback_prompt: str = ""):
+def end_workshop(workshop_id: str, group_photo_url: str, feedback_prompt: str = "", feedback_questions: list = None):
     """
     Marks a workshop as ended/completed.
-    Saves group photo URL and custom feedback prompt.
+    Saves group photo URL, custom feedback prompt, and dynamic feedback questions.
     Automatically posts the group photo to the Media Gallery Activities section!
     """
     conn = get_connection()
@@ -1365,12 +1397,13 @@ def end_workshop(workshop_id: str, group_photo_url: str, feedback_prompt: str = 
     ws_title = row['title'] if row else 'Workshop'
 
     date_now = datetime.now().strftime("%Y-%m-%d")
+    q_json = json.dumps(feedback_questions if feedback_questions is not None else [])
 
     cursor.execute("""
     UPDATE workshops
-    SET is_ended = 1, status = 'Completed', group_photo_url = %s, feedback_prompt = %s
+    SET is_ended = 1, status = 'Completed', group_photo_url = %s, feedback_prompt = %s, feedback_questions_json = %s
     WHERE id = %s
-    """, (group_photo_url.strip(), feedback_prompt.strip(), workshop_id))
+    """, (group_photo_url.strip(), feedback_prompt.strip(), q_json, workshop_id))
 
     # Auto-publish group photo to gallery media for Landing Page Activities showcase
     if group_photo_url.strip():
@@ -1387,29 +1420,45 @@ def end_workshop(workshop_id: str, group_photo_url: str, feedback_prompt: str = 
         "workshop_id": workshop_id,
         "is_ended": 1,
         "group_photo_url": group_photo_url,
-        "feedback_prompt": feedback_prompt
+        "feedback_prompt": feedback_prompt,
+        "feedback_questions": feedback_questions or []
     }
 
-def update_workshop_feedback_prompt(workshop_id: str, feedback_prompt: str):
+def update_workshop_feedback_prompt(workshop_id: str, feedback_prompt: str, feedback_questions: list = None):
+    """Updates workshop feedback prompt and optional dynamic feedback questions."""
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("UPDATE workshops SET feedback_prompt = %s WHERE id = %s", (feedback_prompt.strip(), workshop_id))
+    if feedback_questions is not None:
+        q_json = json.dumps(feedback_questions)
+        cursor.execute("""
+        UPDATE workshops
+        SET feedback_prompt = %s, feedback_questions_json = %s
+        WHERE id = %s
+        """, (feedback_prompt.strip(), q_json, workshop_id))
+    else:
+        cursor.execute("UPDATE workshops SET feedback_prompt = %s WHERE id = %s", (feedback_prompt.strip(), workshop_id))
     updated = cursor.rowcount > 0
     conn.commit()
     conn.close()
-    return {"success": updated, "workshop_id": workshop_id, "feedback_prompt": feedback_prompt}
+    return {
+        "success": updated,
+        "workshop_id": workshop_id,
+        "feedback_prompt": feedback_prompt,
+        "feedback_questions": feedback_questions if feedback_questions is not None else []
+    }
 
-def submit_workshop_feedback(workshop_id: str, student_email: str, student_name: str, rating: int, feedback_text: str, suggestions: str = ""):
-    """Submits student feedback for an ended workshop."""
+def submit_workshop_feedback(workshop_id: str, student_email: str, student_name: str, rating: int, feedback_text: str, suggestions: str = "", answers: dict = None):
+    """Submits student feedback for an ended workshop with custom dynamic answers."""
     conn = get_connection()
     cursor = conn.cursor()
     fb_id = f"fb-{int(datetime.now().timestamp())}"
     date_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    answers_json = json.dumps(answers if isinstance(answers, dict) else {})
     
     cursor.execute("""
-    INSERT INTO workshop_feedbacks (id, workshop_id, student_email, student_name, rating, feedback_text, suggestions, submitted_at)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-    """, (fb_id, workshop_id, student_email.strip(), student_name.strip(), rating, feedback_text.strip(), suggestions.strip(), date_now))
+    INSERT INTO workshop_feedbacks (id, workshop_id, student_email, student_name, rating, feedback_text, suggestions, submitted_at, answers_json)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (fb_id, workshop_id, student_email.strip(), student_name.strip(), rating, feedback_text.strip(), suggestions.strip(), date_now, answers_json))
     
     conn.commit()
     conn.close()
@@ -1421,6 +1470,7 @@ def submit_workshop_feedback(workshop_id: str, student_email: str, student_name:
         "rating": rating,
         "feedback_text": feedback_text,
         "suggestions": suggestions,
+        "answers": answers or {},
         "submitted_at": date_now
     }
 
@@ -1430,7 +1480,7 @@ def get_workshop_feedbacks(workshop_id: str = None):
     cursor = conn.cursor()
     if workshop_id:
         cursor.execute("""
-        SELECT f.*, w.title as workshop_title
+        SELECT f.*, w.title as workshop_title, w.feedback_questions_json
         FROM workshop_feedbacks f
         LEFT JOIN workshops w ON f.workshop_id = w.id
         WHERE f.workshop_id = %s
@@ -1438,14 +1488,33 @@ def get_workshop_feedbacks(workshop_id: str = None):
         """, (workshop_id,))
     else:
         cursor.execute("""
-        SELECT f.*, w.title as workshop_title
+        SELECT f.*, w.title as workshop_title, w.feedback_questions_json
         FROM workshop_feedbacks f
         LEFT JOIN workshops w ON f.workshop_id = w.id
         ORDER BY f.submitted_at DESC
         """)
     rows = cursor.fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    
+    result = []
+    for r in rows:
+        item = dict(r)
+        if item.get('answers_json'):
+            try:
+                item['answers'] = json.loads(item['answers_json'])
+            except Exception:
+                item['answers'] = {}
+        else:
+            item['answers'] = {}
+        if item.get('feedback_questions_json'):
+            try:
+                item['feedback_questions'] = json.loads(item['feedback_questions_json'])
+            except Exception:
+                item['feedback_questions'] = []
+        else:
+            item['feedback_questions'] = []
+        result.append(item)
+    return result
 
 def get_student_feedbacks(student_email: str):
     """Returns list of workshop IDs for which student has submitted feedback."""

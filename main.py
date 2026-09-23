@@ -711,40 +711,48 @@ def remove_team_member(tm_id: str, authorization: Optional[str] = Header(None)):
 class EndWorkshopRequest(BaseModel):
     group_photo_url: str
     feedback_prompt: Optional[str] = ""
+    feedback_questions: Optional[List[Dict[str, Any]]] = []
 
 class WorkshopFeedbackRequest(BaseModel):
     student_email: str
     student_name: Optional[str] = "Student"
     rating: Optional[int] = 5
-    feedback_text: str
+    feedback_text: Optional[str] = ""
     suggestions: Optional[str] = ""
+    answers: Optional[Dict[str, Any]] = {}
 
 class FeedbackPromptRequest(BaseModel):
     feedback_prompt: str = ""
+    feedback_questions: Optional[List[Dict[str, Any]]] = []
 
 @app.post("/api/workshops/{workshop_id}/end")
 def end_workshop_endpoint(workshop_id: str, req: EndWorkshopRequest, authorization: Optional[str] = Header(None)):
     """Admin endpoint to end/complete a workshop, save group photo, and publish feedback form."""
     assert_workshop_access(require_admin(authorization), workshop_id)
-    return end_workshop(workshop_id, req.group_photo_url, req.feedback_prompt or "")
+    return end_workshop(workshop_id, req.group_photo_url, req.feedback_prompt or "", req.feedback_questions or [])
 
 @app.put("/api/workshops/{workshop_id}/feedback-form")
 def update_feedback_form(workshop_id: str, req: FeedbackPromptRequest, authorization: Optional[str] = Header(None)):
     assert_workshop_access(require_admin(authorization), workshop_id)
-    return update_workshop_feedback_prompt(workshop_id, req.feedback_prompt)
+    return update_workshop_feedback_prompt(workshop_id, req.feedback_prompt, req.feedback_questions)
 
 @app.post("/api/workshops/{workshop_id}/feedback")
 def submit_feedback_endpoint(workshop_id: str, req: WorkshopFeedbackRequest):
-    """Student endpoint to submit feedback & suggestions for an ended workshop."""
-    if not req.student_email or not req.feedback_text:
-        raise HTTPException(status_code=400, detail="Student email and feedback text are required")
+    """Student endpoint to submit feedback & suggestions for an ended workshop with dynamic answers."""
+    if not req.student_email:
+        raise HTTPException(status_code=400, detail="Student email is required")
+    fb_text = req.feedback_text or ""
+    if not fb_text and req.answers:
+        # Construct summary string from answers if plain text wasn't provided
+        fb_text = " · ".join([f"{k}: {v}" for k, v in req.answers.items() if v]) or "Submitted custom feedback form"
     return submit_workshop_feedback(
         workshop_id=workshop_id,
         student_email=req.student_email,
         student_name=req.student_name or "Student",
         rating=req.rating or 5,
-        feedback_text=req.feedback_text,
-        suggestions=req.suggestions or ""
+        feedback_text=fb_text,
+        suggestions=req.suggestions or "",
+        answers=req.answers or {}
     )
 
 @app.get("/api/workshops/{workshop_id}/feedbacks")
