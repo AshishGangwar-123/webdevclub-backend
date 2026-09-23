@@ -110,10 +110,10 @@ def fetch_overall_leaderboard(workshop_id):
                s.percentage, s.time_taken_seconds, s.submitted_at
         FROM test_submissions s
         JOIN tests t ON t.id = s.test_id
-        WHERE s.workshop_id = %s AND t.workshop_id = %s AND t.status = 'Published'
-        ORDER BY s.student_email, s.percentage DESC, s.score DESC,
+        WHERE t.workshop_id = %s AND t.status = 'Published'
+        ORDER BY s.student_email, s.test_id, s.percentage DESC, s.score DESC,
                  s.time_taken_seconds ASC NULLS LAST
-    """, (workshop_id, workshop_id))
+    """, (workshop_id,))
     submissions = [dict(r) for r in cur.fetchall()]
     conn.close()
 
@@ -121,8 +121,10 @@ def fetch_overall_leaderboard(workshop_id):
     best = {}
     for sub in submissions:
         email = (sub['student_email'] or '').strip().lower()
+        if not email:
+            continue
         key = (email, sub['test_id'])
-        if email in enrolled and key not in best:
+        if key not in best:
             best[key] = sub
 
     by_email = {}
@@ -132,24 +134,28 @@ def fetch_overall_leaderboard(workshop_id):
     leaderboard = []
     total_quizzes = len(tests)
     for email, attempts in by_email.items():
-        avg_pct = sum(float(a.get('percentage') or 0) for a in attempts) / len(attempts)
-        student = enrolled[email]
+        tot_pct = sum(float(a.get('percentage') or 0) for a in attempts)
+        avg_pct = tot_pct / len(attempts) if attempts else 0
+        student = enrolled.get(email)
+        student_name = (student['name'] if (student and student.get('name')) else None) or attempts[0].get('student_name') or email
+        canonical_email = (student['email'] if (student and student.get('email')) else None) or email
         leaderboard.append({
-            'student_name': student['name'] or attempts[0]['student_name'],
-            'student_email': student['email'],
+            'student_name': student_name,
+            'student_email': canonical_email,
             'average_percentage': round(avg_pct, 2),
+            'total_percentage': round(tot_pct, 2),
             'attempted_quizzes': len(attempts),
             'total_quizzes': total_quizzes,
             'participation_rate': round((len(attempts)/total_quizzes)*100, 2) if total_quizzes else 0,
         })
 
-    leaderboard.sort(key=lambda x: (-x['average_percentage'], -x['attempted_quizzes'], x['student_name'].lower()))
+    leaderboard.sort(key=lambda x: (-x['total_percentage'], -x['average_percentage'], -x['attempted_quizzes'], x['student_name'].lower()))
     for i, e in enumerate(leaderboard, 1):
         e['rank'] = i
 
     return {
         'total_quizzes': total_quizzes,
-        'total_enrolled': len(students),
+        'total_enrolled': max(len(students), len(leaderboard)),
         'leaderboard': leaderboard,
         'top_5': leaderboard[:5],
     }

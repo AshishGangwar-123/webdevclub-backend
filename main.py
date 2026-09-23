@@ -25,6 +25,8 @@ from database import (
     get_all_students,
     register_student_db,
     add_workshop,
+    update_workshop_seats,
+    update_workshop,
     delete_workshop,
     add_notification,
     delete_notification,
@@ -203,6 +205,18 @@ class AddWorkshopRequest(BaseModel):
     admin_username: Optional[str] = ""
     admin_password: Optional[str] = ""
 
+class UpdateWorkshopSeatsRequest(BaseModel):
+    seats: int
+
+class UpdateWorkshopRequest(BaseModel):
+    title: Optional[str] = None
+    mentor: Optional[str] = None
+    date: Optional[str] = None
+    time: Optional[str] = None
+    seats: Optional[int] = None
+    topics: Optional[str] = None
+    color: Optional[str] = None
+
 class AddNotificationRequest(BaseModel):
     title: str
     category: str = "Announcement"
@@ -312,6 +326,36 @@ def create_workshop(req: AddWorkshopRequest, authorization: Optional[str] = Head
         admin_password=req.admin_password or "",
     )
     return result
+
+@app.patch("/api/workshops/{workshop_id}/seats")
+def change_workshop_seats(workshop_id: str, req: UpdateWorkshopSeatsRequest, authorization: Optional[str] = Header(None)):
+    """Allows Super Admin or Scoped Workshop Admin to increase/update workshop seat capacity."""
+    session = require_admin(authorization)
+    assert_workshop_access(session, workshop_id)
+    if req.seats < 0:
+        raise HTTPException(status_code=400, detail="Seats must be a positive number")
+    updated = update_workshop_seats(workshop_id, req.seats)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Workshop not found")
+    return updated
+
+@app.put("/api/workshops/{workshop_id}")
+def edit_workshop(workshop_id: str, req: UpdateWorkshopRequest, authorization: Optional[str] = Header(None)):
+    """Allows Super Admin to update workshop details including seat capacity."""
+    require_super_admin(authorization)
+    updated = update_workshop(
+        workshop_id=workshop_id,
+        title=req.title,
+        mentor=req.mentor,
+        date=req.date,
+        time=req.time,
+        seats=req.seats,
+        topics=req.topics,
+        color=req.color
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Workshop not found")
+    return updated
 
 @app.delete("/api/workshops/{workshop_id}")
 def remove_workshop(workshop_id: str, authorization: Optional[str] = Header(None)):

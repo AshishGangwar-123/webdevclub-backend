@@ -33,7 +33,7 @@ _pool_lock = threading.Lock()
 # Thread-safe High-Performance In-Memory Leaderboard Cache
 _LEADERBOARD_CACHE = {}
 _CACHE_LOCK = threading.Lock()
-_CACHE_TTL = 3.0  # 3 seconds TTL for automatic data freshness
+_CACHE_TTL = 30.0  # 30 seconds TTL with instant cache invalidation on any test/submission change
 
 def invalidate_leaderboard_cache(test_id: str = None, workshop_id: str = None):
     """Instantly invalidates in-memory leaderboard cache so new submissions reflect in real time."""
@@ -436,6 +436,47 @@ def add_workshop(title, mentor, date, time, seats, topics, color='#00f2fe', admi
     conn.commit()
     conn.close()
     return get_workshop_by_id(ws_id)
+
+def update_workshop_seats(workshop_id: str, seats: int):
+    """Updates total seat capacity for a workshop in PostgreSQL DB."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE workshops SET seats = %s WHERE id = %s", (int(seats), workshop_id))
+    updated = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    if updated:
+        return get_workshop_by_id(workshop_id)
+    return None
+
+def update_workshop(workshop_id: str, title: str = None, mentor: str = None, date: str = None, time: str = None, seats: int = None, topics = None, color: str = None):
+    """Updates workshop details including seat capacity in PostgreSQL DB."""
+    current = get_workshop_by_id(workshop_id)
+    if not current:
+        return None
+    
+    new_title = title if title is not None else current['title']
+    new_mentor = mentor if mentor is not None else current['mentor']
+    new_date = date if date is not None else current['date']
+    new_time = time if time is not None else current['time']
+    new_seats = int(seats) if seats is not None else current['seats']
+    new_color = color if color is not None else current.get('color', '#00f2fe')
+    
+    if topics is not None:
+        new_topics = json.dumps(topics if isinstance(topics, list) else [t.strip() for t in str(topics).split(',')])
+    else:
+        new_topics = json.dumps(current.get('topics', []))
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    UPDATE workshops 
+    SET title = %s, mentor = %s, date = %s, time = %s, seats = %s, topics = %s, color = %s
+    WHERE id = %s
+    """, (new_title, new_mentor, new_date, new_time, new_seats, new_topics, new_color, workshop_id))
+    conn.commit()
+    conn.close()
+    return get_workshop_by_id(workshop_id)
 
 def delete_workshop(workshop_id):
     """Deletes a workshop from PostgreSQL DB."""
@@ -1046,7 +1087,8 @@ def toggle_test_live(test_id: str, is_live: int):
     cursor.execute("SELECT * FROM tests WHERE id = %s", (test_id,))
     row = cursor.fetchone()
     conn.close()
-    invalidate_leaderboard_cache(test_id=test_id)
+    ws_id = row['workshop_id'] if row else None
+    invalidate_leaderboard_cache(test_id=test_id, workshop_id=ws_id)
     if row:
         res = dict(row)
         res['questions'] = json.loads(res['questions_json'])
@@ -1062,7 +1104,8 @@ def toggle_test_publish(test_id: str, status: str):
     cursor.execute("SELECT * FROM tests WHERE id = %s", (test_id,))
     row = cursor.fetchone()
     conn.close()
-    invalidate_leaderboard_cache(test_id=test_id)
+    ws_id = row['workshop_id'] if row else None
+    invalidate_leaderboard_cache(test_id=test_id, workshop_id=ws_id)
     if row:
         res = dict(row)
         res['questions'] = json.loads(res['questions_json'])
@@ -1073,11 +1116,14 @@ def delete_test(test_id: str):
     """Deletes a test by ID."""
     conn = get_connection()
     cursor = conn.cursor()
+    cursor.execute("SELECT workshop_id FROM tests WHERE id = %s", (test_id,))
+    test_row = cursor.fetchone()
+    ws_id = test_row['workshop_id'] if test_row else None
     cursor.execute("DELETE FROM tests WHERE id = %s", (test_id,))
     deleted = cursor.rowcount > 0
     conn.commit()
     conn.close()
-    invalidate_leaderboard_cache(test_id=test_id)
+    invalidate_leaderboard_cache(test_id=test_id, workshop_id=ws_id)
     return {"success": deleted, "id": test_id}
 
 def submit_test_answers(test_id: str, student_email: str, student_name: str, user_answers: dict, time_taken_seconds: int = None):
@@ -1668,10 +1714,10 @@ def get_workshop_overall_leaderboard(workshop_id: str, student_email: str = None
                s.percentage, s.time_taken_seconds, s.submitted_at
         FROM test_submissions s
         JOIN tests t ON t.id = s.test_id
-        WHERE s.workshop_id = %s AND t.workshop_id = %s AND t.status = 'Published'
+        WHERE t.workshop_id = %s AND t.status = 'Published'
         ORDER BY s.student_email, s.test_id, s.percentage DESC, s.score DESC,
                  s.time_taken_seconds ASC NULLS LAST, s.submitted_at ASC
-        """, (workshop_id, workshop_id))
+        """, (workshop_id,))
         submissions = cursor.fetchall()
         conn.close()
 
@@ -1683,8 +1729,10 @@ def get_workshop_overall_leaderboard(workshop_id: str, student_email: str = None
         best_attempts = {}
         for submission in submissions:
             email = (submission['student_email'] or '').strip().lower()
+            if not email:
+                continue
             key = (email, submission['test_id'])
-            if email in enrolled_by_email and key not in best_attempts:
+            if key not in best_attempts:
                 best_attempts[key] = submission
 
         attempts_by_email = {}
@@ -1694,14 +1742,18 @@ def get_workshop_overall_leaderboard(workshop_id: str, student_email: str = None
         leaderboard = []
         for email, attempts in attempts_by_email.items():
             total_percentage = sum(float(item['percentage'] or 0) for item in attempts)
+            total_score = sum(int(item['score'] or 0) for item in attempts)
             attempted_quizzes = len(attempts)
             average_percentage = total_percentage / attempted_quizzes if attempted_quizzes else 0
-            student = enrolled_by_email[email]
+            student = enrolled_by_email.get(email)
+            student_name = (student['name'] if (student and student.get('name')) else None) or attempts[0].get('student_name') or email
+            canonical_email = (student['email'] if (student and student.get('email')) else None) or email
             leaderboard.append({
-                "student_name": student['name'] or attempts[0]['student_name'],
-                "student_email": student['email'],
+                "student_name": student_name,
+                "student_email": canonical_email,
                 "average_percentage": round(average_percentage, 2),
                 "total_percentage": round(total_percentage, 2),
+                "total_score": total_score,
                 "attempted_quizzes": attempted_quizzes,
                 "total_quizzes": total_quizzes,
                 "participation_rate": round((attempted_quizzes / total_quizzes) * 100, 2) if total_quizzes else 0,
@@ -1709,9 +1761,9 @@ def get_workshop_overall_leaderboard(workshop_id: str, student_email: str = None
             })
 
         leaderboard.sort(key=lambda item: (
+            -item['total_percentage'],
             -item['average_percentage'],
             -item['attempted_quizzes'],
-            -item['total_percentage'],
             item['student_name'].lower(),
         ))
         for index, entry in enumerate(leaderboard, start=1):
@@ -1720,10 +1772,10 @@ def get_workshop_overall_leaderboard(workshop_id: str, student_email: str = None
         base_data = {
             "workshop_id": workshop_id,
             "total_quizzes": total_quizzes,
-            "total_enrolled": len(students),
+            "total_enrolled": max(len(students), len(leaderboard)),
             "ranked_students": len(leaderboard),
             "unranked_students": max(len(students) - len(leaderboard), 0),
-            "normalization": "Average percentage across attempted published quizzes; absent or not-attempted quizzes are excluded.",
+            "normalization": "Total percentage and average across attempted published quizzes.",
             "leaderboard": leaderboard,
             "top_5": leaderboard[:5]
         }
