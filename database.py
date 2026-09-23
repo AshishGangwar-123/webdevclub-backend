@@ -800,7 +800,7 @@ def student_login(email: str, password: str):
     cursor = conn.cursor()
     cursor.execute("""
     SELECT s.*, w.title as full_workshop_title, w.mentor, w.date as workshop_date, w.time as workshop_time, w.topics, w.color,
-           w.is_ended, w.group_photo_url, w.feedback_prompt, w.feedback_questions_json
+           w.status as workshop_status, w.is_ended, w.group_photo_url, w.feedback_prompt, w.feedback_questions_json
     FROM students s
     LEFT JOIN workshops w ON s.workshop_id = w.id
     WHERE LOWER(s.email) = LOWER(%s)
@@ -821,6 +821,15 @@ def student_login(email: str, password: str):
                 reg['feedback_questions'] = []
         else:
             reg['feedback_questions'] = []
+            
+        # Normalize is_ended
+        is_ended_raw = reg.get('is_ended')
+        ws_status_raw = str(reg.get('workshop_status') or reg.get('status') or '').strip().lower()
+        if is_ended_raw in (1, True, '1', 'true') or ws_status_raw == 'completed':
+            reg['is_ended'] = 1
+        else:
+            reg['is_ended'] = 0
+
         if reg.get('allowed') == 1:
             cursor.execute("SELECT * FROM workshop_resources WHERE workshop_id = %s ORDER BY date_added DESC", (reg['workshop_id'],))
             reg['resources'] = [dict(r) for r in cursor.fetchall()]
@@ -841,7 +850,7 @@ def get_student_dashboard_data(email: str):
     cursor = conn.cursor()
     cursor.execute("""
     SELECT s.*, w.title as full_workshop_title, w.mentor, w.date as workshop_date, w.time as workshop_time, w.topics, w.color,
-           w.is_ended, w.group_photo_url, w.feedback_prompt, w.feedback_questions_json
+           w.status as workshop_status, w.is_ended, w.group_photo_url, w.feedback_prompt, w.feedback_questions_json
     FROM students s
     LEFT JOIN workshops w ON s.workshop_id = w.id
     WHERE LOWER(s.email) = LOWER(%s)
@@ -861,6 +870,15 @@ def get_student_dashboard_data(email: str):
                 reg['feedback_questions'] = []
         else:
             reg['feedback_questions'] = []
+
+        # Normalize is_ended
+        is_ended_raw = reg.get('is_ended')
+        ws_status_raw = str(reg.get('workshop_status') or reg.get('status') or '').strip().lower()
+        if is_ended_raw in (1, True, '1', 'true') or ws_status_raw == 'completed':
+            reg['is_ended'] = 1
+        else:
+            reg['is_ended'] = 0
+
         if reg.get('allowed') == 1:
             cursor.execute("SELECT * FROM workshop_resources WHERE workshop_id = %s ORDER BY date_added DESC", (reg['workshop_id'],))
             reg['resources'] = [dict(r) for r in cursor.fetchall()]
